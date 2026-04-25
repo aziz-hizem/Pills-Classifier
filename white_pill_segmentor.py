@@ -239,7 +239,7 @@ def segment_white_pills(
     texture_thresh: float = 10.0,   # std-dev below this → smooth → pill candidate
     # ── Background removal ────────────────────────────────────────────────
     dark_val_max: int     = 60,     # exclude very dark pixels (shadow/edge)
-    bright_val_min: int   = 240,    # exclude blown-out specular highlights
+    bright_val_min: int   = 250,    # exclude blown-out specular highlights
     # ── Morphological cleanup ─────────────────────────────────────────────
     morph_open_iter: int  = 2,      # iterations of opening  (noise removal)
     morph_close_iter: int = 3,      # iterations of closing  (hole filling)

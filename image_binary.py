@@ -385,6 +385,8 @@ def process_image(
 	wp_min_area: float,
 	wp_convexity: float,
 	wp_solidity: float,
+	wp_dark_vmax: float,
+	wp_bright_vmin: float,
 ) -> ProcessedImages:
 	bgr = cv2.imread(str(image_path))
 	if bgr is None:
@@ -420,6 +422,8 @@ def process_image(
 			white_balanced,
 			texture_kernel   = tex_kernel,
 			texture_thresh   = tex_thresh,
+			dark_val_max     = int(wp_dark_vmax),
+			bright_val_min   = int(wp_bright_vmin),
 			morph_open_iter  = morph_open,
 			morph_close_iter = morph_close,
 			separation       = wp_separation,
@@ -514,6 +518,8 @@ class ImagePipelineUI(tk.Tk):
 		self._wp_min_area     = tk.DoubleVar(value=0.30)
 		self._wp_convexity    = tk.DoubleVar(value=0.80)
 		self._wp_solidity     = tk.DoubleVar(value=0.75)
+		self._wp_dark_vmax    = tk.DoubleVar(value=60.0)
+		self._wp_bright_vmin  = tk.DoubleVar(value=250.0)
 
 		self._build_layout()
 		self._run_pipeline()
@@ -610,6 +616,10 @@ class ImagePipelineUI(tk.Tk):
 		slider_row(self._white_frame, 6, self.wp_conv_label, "WP convexity: 0.80", 0.50, 1.0, self._wp_convexity)
 		self.wp_solid_label = ttk.Label(self._white_frame)
 		slider_row(self._white_frame, 7, self.wp_solid_label, "WP solidity: 0.75", 0.40, 1.0, self._wp_solidity)
+		self.wp_dark_label = ttk.Label(self._white_frame)
+		slider_row(self._white_frame, 8, self.wp_dark_label, "WP dark V max: 60", 0.0, 140.0, self._wp_dark_vmax)
+		self.wp_bright_label = ttk.Label(self._white_frame)
+		slider_row(self._white_frame, 9, self.wp_bright_label, "WP bright V min: 250", 200.0, 255.0, self._wp_bright_vmin)
 
 		controls.columnconfigure(1, weight=1)
 
@@ -705,6 +715,8 @@ class ImagePipelineUI(tk.Tk):
 		self.wp_area_label.configure(text=f"WP min area %: {self._wp_min_area.get():.2f}")
 		self.wp_conv_label.configure(text=f"WP convexity: {self._wp_convexity.get():.2f}")
 		self.wp_solid_label.configure(text=f"WP solidity: {self._wp_solidity.get():.2f}")
+		self.wp_dark_label.configure(text=f"WP dark V max: {self._wp_dark_vmax.get():.0f}")
+		self.wp_bright_label.configure(text=f"WP bright V min: {self._wp_bright_vmin.get():.0f}")
 		# Debounce: wait 120 ms after the last slider move before re-running
 		if self._update_job is not None:
 			self.after_cancel(self._update_job)
@@ -754,6 +766,8 @@ class ImagePipelineUI(tk.Tk):
 			wp_min_area      = float(self._wp_min_area.get()),
 			wp_convexity     = float(self._wp_convexity.get()),
 			wp_solidity      = float(self._wp_solidity.get()),
+			wp_dark_vmax     = float(self._wp_dark_vmax.get()),
+			wp_bright_vmin   = float(self._wp_bright_vmin.get()),
 		)
 
 		self.count_label.configure(text=f"Pills: {processed.pill_count}")
