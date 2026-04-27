@@ -1,3 +1,4 @@
 backup/
 venv/
 __pycache__/
+.claude/

@@ -486,16 +486,12 @@ def process_image(
 	min_circularity: float,
 	stddev_max: float,
 	# white-pill params
-	tex_kernel: int,
-	tex_thresh: float,
 	morph_open: int,
 	morph_close: int,
 	wp_separation: float,
 	wp_min_area: float,
-	wp_convexity: float,
 	wp_solidity: float,
-	wp_dark_vmax: float,
-	wp_bright_vmin: float,
+	wp_brightness_floor: int,
 ) -> ProcessedImages:
 	bgr = cv2.imread(str(image_path))
 	if bgr is None:
@@ -529,32 +525,33 @@ def process_image(
 			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
 
 	elif color_result.color_class == PillColorClass.WHITE:
-		wp_result    = segment_white_pills(
+		search_mask = (
+			contour_mask if blister_contour is not None
+			else np.ones(white_balanced.shape[:2], dtype=np.uint8) * 255
+		)
+		wp_result = segment_white_pills(
 			white_balanced,
-			texture_kernel   = tex_kernel,
-			texture_thresh   = tex_thresh,
-			dark_val_max     = int(wp_dark_vmax),
-			bright_val_min   = int(wp_bright_vmin),
+			contour_mask     = search_mask,
+			brightness_floor = int(wp_brightness_floor),
 			morph_open_iter  = morph_open,
 			morph_close_iter = morph_close,
 			separation       = wp_separation,
 			min_area_ratio   = wp_min_area / 100.0,
-			min_convexity    = wp_convexity,
 			min_solidity     = wp_solidity,
 		)
-		pill_mask    = cv2.bitwise_and(wp_result.pill_mask, contour_mask)
-		contours, _  = cv2.findContours(pill_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-		contours     = _filter_white_contours_by_size(contours, white_balanced.shape)
-		count        = len(contours)
-		pill_mask    = np.zeros_like(pill_mask)
+		pill_mask   = wp_result.pill_mask
+		contours, _ = cv2.findContours(pill_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+		contours    = _filter_white_contours_by_size(contours, white_balanced.shape)
+		count       = len(contours)
+		pill_mask   = np.zeros_like(pill_mask)
 		if contours:
 			cv2.drawContours(pill_mask, contours, -1, 255, -1)
-		annotated    = white_balanced.copy()
+		annotated = white_balanced.copy()
 		if blister_contour is not None:
 			cv2.drawContours(annotated, [blister_contour], -1, (255, 0, 0), 3)
 		if contours:
 			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
-		white_debug  = wp_result.debug_images
+		white_debug = wp_result.debug_images
 
 	# UNKNOWN: all outputs stay at safe empty defaults set above
 
@@ -615,8 +612,8 @@ class ImagePipelineUI(tk.Tk):
 		self._image_paths = image_paths if image_paths is not None else self._load_images_from_folder()
 		self._image_index = self._resolve_image_index(image_path)
 		self._update_job  = None
-		self._colored_visible = True
-		self._white_visible = True
+		self._colored_visible = False
+		self._white_visible = False
 
 		# ── Colored-pill sliders ──────────────────────────────────────
 		self._clahe_clip      = tk.DoubleVar(value=2.0)
@@ -629,16 +626,12 @@ class ImagePipelineUI(tk.Tk):
 		self._min_circularity = tk.DoubleVar(value=0.15)
 		self._stddev_max      = tk.DoubleVar(value=0.0)
 		# ── White-pill sliders ────────────────────────────────────────
-		self._tex_kernel      = tk.IntVar(value=7)
-		self._tex_thresh      = tk.DoubleVar(value=0.0)
-		self._morph_open      = tk.IntVar(value=2)
-		self._morph_close     = tk.IntVar(value=4)
-		self._wp_separation   = tk.DoubleVar(value=0.40)
-		self._wp_min_area     = tk.DoubleVar(value=0.30)
-		self._wp_convexity    = tk.DoubleVar(value=0.70)
-		self._wp_solidity     = tk.DoubleVar(value=0.50)
-		self._wp_dark_vmax    = tk.DoubleVar(value=101.0)
-		self._wp_bright_vmin  = tk.DoubleVar(value=160.0)
+		self._wp_brightness_floor = tk.DoubleVar(value=205.0)
+		self._morph_open          = tk.IntVar(value=1)
+		self._morph_close         = tk.IntVar(value=3)
+		self._wp_separation       = tk.DoubleVar(value=0.40)
+		self._wp_min_area         = tk.DoubleVar(value=0.30)
+		self._wp_solidity         = tk.DoubleVar(value=0.50)
 
 		self._build_layout()
 		self._run_pipeline()
@@ -679,11 +672,12 @@ class ImagePipelineUI(tk.Tk):
 		ttk.Label(colored_header, text="Colored pill settings", font=("Segoe UI", 9, "bold")).pack(
 			side="left"
 		)
-		self._colored_toggle = ttk.Button(colored_header, text="Hide", command=self._toggle_colored)
+		self._colored_toggle = ttk.Button(colored_header, text="Show", command=self._toggle_colored)
 		self._colored_toggle.pack(side="right")
 
 		self._colored_frame = ttk.Frame(controls)
 		self._colored_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+		self._colored_frame.grid_remove()
 
 		self.sat_label = ttk.Label(self._colored_frame)
 		slider_row(self._colored_frame, 0, self.sat_label, "Saturation min: 35", 0.0, 120.0, self._sat_thresh)
@@ -713,32 +707,25 @@ class ImagePipelineUI(tk.Tk):
 		ttk.Label(white_header, text="White pill settings", font=("Segoe UI", 9, "bold")).pack(
 			side="left"
 		)
-		self._white_toggle = ttk.Button(white_header, text="Hide", command=self._toggle_white)
+		self._white_toggle = ttk.Button(white_header, text="Show", command=self._toggle_white)
 		self._white_toggle.pack(side="right")
 
 		self._white_frame = ttk.Frame(controls)
 		self._white_frame.grid(row=4, column=0, columnspan=2, sticky="ew")
+		self._white_frame.grid_remove()
 
-		self.tex_kernel_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 0, self.tex_kernel_label, "Texture kernel: 7", 3, 15, self._tex_kernel)
-		self.tex_thresh_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 1, self.tex_thresh_label, "Foil var thresh (0=auto): 0.0", 0.0, 30.0, self._tex_thresh)
+		self.wp_bright_floor_label = ttk.Label(self._white_frame)
+		slider_row(self._white_frame, 0, self.wp_bright_floor_label, "Brightness floor: 205", 140.0, 240.0, self._wp_brightness_floor)
 		self.morph_open_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 2, self.morph_open_label, "Morph open iter: 2", 1, 6, self._morph_open)
+		slider_row(self._white_frame, 1, self.morph_open_label, "Morph open iter: 1", 1, 6, self._morph_open)
 		self.morph_close_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 3, self.morph_close_label, "Morph close iter: 4", 1, 8, self._morph_close)
+		slider_row(self._white_frame, 2, self.morph_close_label, "Morph close iter: 3", 1, 8, self._morph_close)
 		self.wp_sep_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 4, self.wp_sep_label, "WP separation: 0.40", 0.25, 0.70, self._wp_separation)
+		slider_row(self._white_frame, 3, self.wp_sep_label, "WP separation: 0.40", 0.25, 0.70, self._wp_separation)
 		self.wp_area_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 5, self.wp_area_label, "WP min area %: 0.30", 0.05, 2.0, self._wp_min_area)
-		self.wp_conv_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 6, self.wp_conv_label, "WP convexity: 0.70", 0.50, 1.0, self._wp_convexity)
+		slider_row(self._white_frame, 4, self.wp_area_label, "WP min area %: 0.30", 0.05, 2.0, self._wp_min_area)
 		self.wp_solid_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 7, self.wp_solid_label, "WP solidity: 0.50", 0.10, 1.0, self._wp_solidity)
-		self.wp_dark_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 8, self.wp_dark_label, "Adaptive block size: 101", 51.0, 151.0, self._wp_dark_vmax)
-		self.wp_bright_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 9, self.wp_bright_label, "Adaptive C strength: 160", 160.0, 255.0, self._wp_bright_vmin)
+		slider_row(self._white_frame, 5, self.wp_solid_label, "WP solidity: 0.50", 0.10, 1.0, self._wp_solidity)
 
 		controls.columnconfigure(1, weight=1)
 
@@ -826,16 +813,12 @@ class ImagePipelineUI(tk.Tk):
 		self.area_label.configure(text=f"Min area %: {self._min_area.get():.2f}")
 		self.circ_label.configure(text=f"Min circularity: {self._min_circularity.get():.2f}")
 		self.stddev_label.configure(text=f"Max V stddev (0=off): {self._stddev_max.get():.1f}")
-		self.tex_kernel_label.configure(text=f"Texture kernel: {int(self._tex_kernel.get())}")
-		self.tex_thresh_label.configure(text=f"Foil var thresh (0=auto): {self._tex_thresh.get():.1f}")
+		self.wp_bright_floor_label.configure(text=f"Brightness floor: {self._wp_brightness_floor.get():.0f}")
 		self.morph_open_label.configure(text=f"Morph open iter: {int(self._morph_open.get())}")
 		self.morph_close_label.configure(text=f"Morph close iter: {int(self._morph_close.get())}")
 		self.wp_sep_label.configure(text=f"WP separation: {self._wp_separation.get():.2f}")
 		self.wp_area_label.configure(text=f"WP min area %: {self._wp_min_area.get():.2f}")
-		self.wp_conv_label.configure(text=f"WP convexity: {self._wp_convexity.get():.2f}")
 		self.wp_solid_label.configure(text=f"WP solidity: {self._wp_solidity.get():.2f}")
-		self.wp_dark_label.configure(text=f"Adaptive block size: {self._wp_dark_vmax.get():.0f}")
-		self.wp_bright_label.configure(text=f"Adaptive C strength: {self._wp_bright_vmin.get():.0f}")
 		# Debounce: wait 120 ms after the last slider move before re-running
 		if self._update_job is not None:
 			self.after_cancel(self._update_job)
@@ -877,16 +860,12 @@ class ImagePipelineUI(tk.Tk):
 			min_area_ratio   = float(self._min_area.get()) / 100.0,
 			min_circularity  = float(self._min_circularity.get()),
 			stddev_max       = float(self._stddev_max.get()),
-			tex_kernel       = int(self._tex_kernel.get()),
-			tex_thresh       = float(self._tex_thresh.get()),
-			morph_open       = int(self._morph_open.get()),
-			morph_close      = int(self._morph_close.get()),
-			wp_separation    = float(self._wp_separation.get()),
-			wp_min_area      = float(self._wp_min_area.get()),
-			wp_convexity     = float(self._wp_convexity.get()),
-			wp_solidity      = float(self._wp_solidity.get()),
-			wp_dark_vmax     = float(self._wp_dark_vmax.get()),
-			wp_bright_vmin   = float(self._wp_bright_vmin.get()),
+			morph_open           = int(self._morph_open.get()),
+			morph_close          = int(self._morph_close.get()),
+			wp_separation        = float(self._wp_separation.get()),
+			wp_min_area          = float(self._wp_min_area.get()),
+			wp_solidity          = float(self._wp_solidity.get()),
+			wp_brightness_floor  = int(self._wp_brightness_floor.get()),
 		)
 
 		self.count_label.configure(text=f"Pills: {processed.pill_count}")
@@ -898,9 +877,8 @@ class ImagePipelineUI(tk.Tk):
 			steps = [
 				("Original",           processed.original_bgr),
 				("White balanced",     processed.white_balanced_bgr),
-				("Texture map",        wd.get("texture_map",    processed.white_balanced_bgr)),
-				("Texture threshold",  wd.get("texture_thresh", processed.white_balanced_bgr)),
-				("Cleaned mask",       wd.get("cleaned_mask",   processed.white_balanced_bgr)),
+				("White mask",         wd.get("white_mask",    processed.white_balanced_bgr)),
+				("Cleaned mask",       wd.get("cleaned_mask",  processed.white_balanced_bgr)),
 				("Distance transform", wd.get("distance",       processed.white_balanced_bgr)),
 				("Mask (pills white)", processed.mask),
 				("Detected pills",     processed.annotated_bgr),
