@@ -31,6 +31,8 @@ class ProcessedImages:
 	sample_pixel_ratio: float
 	color_name: str
 	white_debug_images: Optional[Dict[str, np.ndarray]] = field(default=None)
+	empty_cell_count: int = 0
+	empty_cell_contours: list = field(default_factory=list)
 
 
 class PillColorClass(Enum):
@@ -170,6 +172,90 @@ def detect_blister_contour(bgr: np.ndarray) -> Optional[np.ndarray]:
 	rect = cv2.minAreaRect(hull)
 	box = cv2.boxPoints(rect)
 	return box.astype("int32").reshape(-1, 1, 2)
+
+
+def detect_empty_cells(
+	bgr: np.ndarray,
+	blister_contour: Optional[np.ndarray],
+	pill_contours: list,
+) -> Tuple[int, list]:
+	"""
+	Detect empty blister cells by running HoughCircles on the image and keeping
+	only circles whose center falls inside the scan zone (blister interior minus
+	detected pill regions). HoughCircles accumulates votes from partial arcs, so
+	it works even when only part of the dome rim is visible.
+	"""
+	if not pill_contours:
+		return 0, []
+
+	h, w = bgr.shape[:2]
+
+	areas = [cv2.contourArea(c) for c in pill_contours]
+	avg_area = float(np.mean(areas))
+	if avg_area <= 0:
+		return 0, []
+	avg_radius = max(5, int(np.sqrt(avg_area / np.pi)))
+
+	# Blister interior mask
+	blister_mask = np.zeros((h, w), dtype=np.uint8)
+	if blister_contour is not None:
+		cv2.drawContours(blister_mask, [blister_contour], -1, 255, -1)
+	else:
+		blister_mask[:] = 255
+
+	# Pill exclusion zone: dilate detected pill regions so we ignore their edges
+	pill_excl = np.zeros((h, w), dtype=np.uint8)
+	cv2.drawContours(pill_excl, pill_contours, -1, 255, -1)
+	margin = max(3, avg_radius // 5)
+	dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin * 2 + 1, margin * 2 + 1))
+	pill_excl = cv2.dilate(pill_excl, dil_k, iterations=2)
+
+	# Scan zone: inside blister, not on a detected pill
+	scan_zone = cv2.bitwise_and(blister_mask, cv2.bitwise_not(pill_excl))
+
+	# Moderate blur: suppress fine foil texture (~5px period) but preserve dome-rim edges
+	blur_size = max(7, avg_radius // 4)
+	if blur_size % 2 == 0:
+		blur_size += 1
+	gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+	blurred = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
+
+	# HoughCircles finds all pill-sized circles (filled and empty) in the image.
+	# Empty cells are identified by their center falling in the scan zone.
+	min_r    = max(5, int(avg_radius * 0.55))
+	max_r    = int(avg_radius * 1.45)
+	min_dist = max(int(avg_radius * 1.5), min_r * 2)
+
+	circles = cv2.HoughCircles(
+		blurred,
+		cv2.HOUGH_GRADIENT,
+		dp=1,
+		minDist=min_dist,
+		param1=50,   # internal Canny high threshold
+		param2=25,   # accumulator votes required (lower = more sensitive)
+		minRadius=min_r,
+		maxRadius=max_r,
+	)
+
+	if circles is None:
+		return 0, []
+
+	circles = np.round(circles[0]).astype(int)
+
+	empty_contours = []
+	for cx, cy, r in circles:
+		if cx < 0 or cy < 0 or cx >= w or cy >= h:
+			continue
+		if scan_zone[cy, cx] == 0:
+			continue
+		# Convert the detected circle to a contour for drawing
+		tmp = np.zeros((h, w), dtype=np.uint8)
+		cv2.circle(tmp, (cx, cy), r, 255, -1)
+		cnts, _ = cv2.findContours(tmp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+		if cnts:
+			empty_contours.append(cnts[0])
+
+	return len(empty_contours), empty_contours
 
 
 def _contour_mask(shape: Tuple[int, int, int], contour: Optional[np.ndarray]) -> np.ndarray:
@@ -504,11 +590,13 @@ def process_image(
 	contour_mask = _contour_mask(rectified.shape, blister_contour)
 
 	# Initialise outputs — overwritten by whichever path runs
-	pill_mask    = np.zeros(rectified.shape[:2], dtype=np.uint8)
-	count        = 0
-	contours     = []
-	annotated    = white_balanced.copy()
+	pill_mask      = np.zeros(rectified.shape[:2], dtype=np.uint8)
+	count          = 0
+	contours       = []
+	annotated      = white_balanced.copy()
 	white_debug: Dict[str, np.ndarray] = {}
+	empty_count    = 0
+	empty_contours: list = []
 
 	if color_result.color_class == PillColorClass.COLORED:
 		pill_mask = _segment_pills(
@@ -521,8 +609,13 @@ def process_image(
 			min_circularity=min_circularity,
 			stddev_max=stddev_max,
 		)
+		if blister_contour is not None:
+			cv2.drawContours(annotated, [blister_contour], -1, (255, 0, 0), 3)
 		if contours:
 			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
+		empty_count, empty_contours = detect_empty_cells(white_balanced, blister_contour, contours)
+		if empty_contours:
+			cv2.drawContours(annotated, empty_contours, -1, (0, 165, 255), 3)
 
 	elif color_result.color_class == PillColorClass.WHITE:
 		search_mask = (
@@ -551,6 +644,9 @@ def process_image(
 			cv2.drawContours(annotated, [blister_contour], -1, (255, 0, 0), 3)
 		if contours:
 			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
+		empty_count, empty_contours = detect_empty_cells(white_balanced, blister_contour, contours)
+		if empty_contours:
+			cv2.drawContours(annotated, empty_contours, -1, (0, 165, 255), 3)
 		white_debug = wp_result.debug_images
 
 	# UNKNOWN: all outputs stay at safe empty defaults set above
@@ -576,6 +672,8 @@ def process_image(
 		sample_pixel_ratio  = color_result.sample_pixel_ratio,
 		color_name          = color_name,
 		white_debug_images  = white_debug or None,
+		empty_cell_count    = empty_count,
+		empty_cell_contours = empty_contours,
 	)
 
 
@@ -649,6 +747,22 @@ class ImagePipelineUI(tk.Tk):
 
 		btn_group = ttk.Frame(header)
 		btn_group.pack(side="right")
+
+		# Status lights (packed right-to-left, so declare right first)
+		lights_frame = ttk.Frame(header)
+		lights_frame.pack(side="right", padx=(0, 16))
+
+		self._color_canvas = tk.Canvas(lights_frame, width=18, height=18, highlightthickness=0)
+		self._color_oval   = self._color_canvas.create_oval(1, 1, 17, 17, fill="green", outline="#555")
+		self._color_canvas.pack(side="right", padx=(4, 0))
+		ttk.Label(lights_frame, text="Color anomaly").pack(side="right")
+
+		ttk.Label(lights_frame, text="   ").pack(side="right")
+
+		self._empty_canvas = tk.Canvas(lights_frame, width=18, height=18, highlightthickness=0)
+		self._empty_oval   = self._empty_canvas.create_oval(1, 1, 17, 17, fill="green", outline="#555")
+		self._empty_canvas.pack(side="right", padx=(4, 0))
+		ttk.Label(lights_frame, text="Empty cells").pack(side="right")
 		ttk.Button(btn_group, text="Previous",   command=self._prev_image).pack(side="left", padx=(0, 6))
 		ttk.Button(btn_group, text="Next",        command=self._next_image).pack(side="left", padx=(0, 6))
 		ttk.Button(btn_group, text="Open Image",  command=self._open_image).pack(side="left")
@@ -870,6 +984,10 @@ class ImagePipelineUI(tk.Tk):
 
 		self.count_label.configure(text=f"Pills: {processed.pill_count}")
 		self._update_color_label(processed)
+
+		empty_light = "red" if processed.empty_cell_count > 0 else "green"
+		self._empty_canvas.itemconfigure(self._empty_oval, fill=empty_light)
+		self._color_canvas.itemconfigure(self._color_oval, fill="green")  # placeholder
 
 		# Adaptive panel set: white path shows texture debug; colored path shows standard
 		if processed.color_class == PillColorClass.WHITE and processed.white_debug_images:
