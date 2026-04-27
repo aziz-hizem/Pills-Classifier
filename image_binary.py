@@ -76,6 +76,21 @@ def _four_point_warp(
 	return cv2.warpPerspective(bgr, transform, (width, height))
 
 
+def _resize_keep_aspect(
+	bgr: np.ndarray,
+	max_size: Tuple[int, int],
+) -> np.ndarray:
+	h, w = bgr.shape[:2]
+	max_w, max_h = max_size
+	if h <= 0 or w <= 0:
+		return bgr.copy()
+	scale = min(max_w / w, max_h / h)
+	new_w = max(1, int(round(w * scale)))
+	new_h = max(1, int(round(h * scale)))
+	interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+	return cv2.resize(bgr, (new_w, new_h), interpolation=interp)
+
+
 # ── Pack rectification ────────────────────────────────────────────────────────
 
 def _rectify_pack(bgr: np.ndarray, output_size: Tuple[int, int]) -> np.ndarray:
@@ -93,34 +108,128 @@ def _rectify_pack(bgr: np.ndarray, output_size: Tuple[int, int]) -> np.ndarray:
 
 	contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 	if not contours:
-		return cv2.resize(bgr, output_size)
+		return _resize_keep_aspect(bgr, output_size)
 
 	contours = sorted(contours, key=cv2.contourArea, reverse=True)
 	pack_contour = contours[0]
 	image_area = resized.shape[0] * resized.shape[1]
 	if cv2.contourArea(pack_contour) < 0.2 * image_area:
-		return cv2.resize(bgr, output_size)
+		return _resize_keep_aspect(bgr, output_size)
 
 	rect = cv2.minAreaRect(pack_contour)
 	box = cv2.boxPoints(rect)
 	points = box.reshape(-1, 2) / scale
 
-	rect_w, rect_h = rect[1]
-	if rect_w <= 1 or rect_h <= 1:
-		return cv2.resize(bgr, output_size)
+	ordered = _order_points(points.astype(np.float32))
+	(tl, tr, br, bl) = ordered
+	width_a = np.linalg.norm(br - bl)
+	width_b = np.linalg.norm(tr - tl)
+	height_a = np.linalg.norm(tr - br)
+	height_b = np.linalg.norm(tl - bl)
+	warp_width = int(round(max(width_a, width_b)))
+	warp_height = int(round(max(height_a, height_b)))
+	if warp_width <= 1 or warp_height <= 1:
+		return _resize_keep_aspect(bgr, output_size)
 
-	max_w, max_h = output_size
-	if rect_w < rect_h:
-		rect_w, rect_h = rect_h, rect_w
-	aspect = rect_w / rect_h
-	if max_w / max_h > aspect:
-		width = int(max_h * aspect)
-		height = max_h
-	else:
-		width = max_w
-		height = int(max_w / aspect)
+	warped = _four_point_warp(bgr, points.astype(np.float32), (warp_width, warp_height))
 
-	return _four_point_warp(bgr, points.astype(np.float32), (width, height))
+	# Rotation is allowed; use it to match target orientation without stretching.
+	target_landscape = output_size[0] >= output_size[1]
+	warp_landscape = warped.shape[1] >= warped.shape[0]
+	if target_landscape != warp_landscape:
+		warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+
+	return _resize_keep_aspect(warped, output_size)
+
+
+# ── Blister contour detection ───────────────────────────────────────────────
+
+def detect_blister_contour(bgr: np.ndarray) -> Optional[np.ndarray]:
+	lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+	l_channel = lab[:, :, 0]
+	l_blur = cv2.GaussianBlur(l_channel, (7, 7), 0)
+
+	adaptive = cv2.adaptiveThreshold(
+		l_blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 2
+	)
+
+	gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+	_, not_white = cv2.threshold(gray, 235, 255, cv2.THRESH_BINARY_INV)
+	mask = cv2.bitwise_and(adaptive, not_white)
+
+	kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+	closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+	closed = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
+
+	contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+	if not contours:
+		return None
+
+	largest = max(contours, key=cv2.contourArea)
+	hull = cv2.convexHull(largest)
+	rect = cv2.minAreaRect(hull)
+	box = cv2.boxPoints(rect)
+	return box.astype("int32").reshape(-1, 1, 2)
+
+
+def _contour_mask(shape: Tuple[int, int, int], contour: Optional[np.ndarray]) -> np.ndarray:
+	mask = np.zeros(shape[:2], dtype=np.uint8)
+	if contour is None:
+		return mask
+	cv2.drawContours(mask, [contour], -1, 255, -1)
+	return mask
+
+
+def _filter_white_contours_by_size(
+	contours: list,
+	image_shape: Tuple[int, int, int],
+	min_short_ratio: float = 0.015,
+	max_long_ratio: float = 0.40,
+	max_aspect_ratio: float = 4.0,
+	median_low: float = 0.5,
+	median_high: float = 1.8,
+	min_for_median_filter: int = 4,
+) -> list:
+	"""Reject implausible white-pill contours such as long/flat glare streaks."""
+	height, width = image_shape[:2]
+	max_dim = float(max(height, width))
+
+	candidates = []
+	for contour in contours:
+		(_, _), (w, h), _ = cv2.minAreaRect(contour)
+		long_side = float(max(w, h))
+		short_side = float(min(w, h))
+		if short_side <= 1e-6:
+			continue
+		aspect_ratio = long_side / short_side
+
+		# Hard bounds remove obvious non-pill artifacts before robust statistics.
+		if short_side < min_short_ratio * float(height):
+			continue
+		if long_side > max_long_ratio * max_dim:
+			continue
+		if aspect_ratio > max_aspect_ratio:
+			continue
+
+		candidates.append((contour, short_side, long_side))
+
+	if len(candidates) < min_for_median_filter:
+		return [contour for contour, _, _ in candidates]
+
+	short_sides = np.array([short_side for _, short_side, _ in candidates], dtype=np.float32)
+	long_sides = np.array([long_side for _, _, long_side in candidates], dtype=np.float32)
+	median_short = float(np.median(short_sides))
+	median_long = float(np.median(long_sides))
+
+	filtered = []
+	for contour, short_side, long_side in candidates:
+		if (
+			median_low * median_short <= short_side <= median_high * median_short
+			and median_low * median_long <= long_side <= median_high * median_long
+		):
+			filtered.append(contour)
+
+	return filtered
 
 
 # ── White balance correction ──────────────────────────────────────────────────
@@ -395,6 +504,8 @@ def process_image(
 	rectified        = _rectify_pack(bgr, (800, 500))
 	white_balanced, _= correct_white_balance(rectified)
 	color_result     = classify_pill_color(white_balanced)
+	blister_contour = detect_blister_contour(rectified)
+	contour_mask = _contour_mask(rectified.shape, blister_contour)
 
 	# Initialise outputs — overwritten by whichever path runs
 	pill_mask    = np.zeros(rectified.shape[:2], dtype=np.uint8)
@@ -431,10 +542,18 @@ def process_image(
 			min_convexity    = wp_convexity,
 			min_solidity     = wp_solidity,
 		)
-		pill_mask    = wp_result.pill_mask
-		count        = wp_result.pill_count
-		contours     = wp_result.contours
-		annotated    = wp_result.debug_images.get("annotated", annotated)
+		pill_mask    = cv2.bitwise_and(wp_result.pill_mask, contour_mask)
+		contours, _  = cv2.findContours(pill_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+		contours     = _filter_white_contours_by_size(contours, white_balanced.shape)
+		count        = len(contours)
+		pill_mask    = np.zeros_like(pill_mask)
+		if contours:
+			cv2.drawContours(pill_mask, contours, -1, 255, -1)
+		annotated    = white_balanced.copy()
+		if blister_contour is not None:
+			cv2.drawContours(annotated, [blister_contour], -1, (255, 0, 0), 3)
+		if contours:
+			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
 		white_debug  = wp_result.debug_images
 
 	# UNKNOWN: all outputs stay at safe empty defaults set above
