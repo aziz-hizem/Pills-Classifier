@@ -1236,11 +1236,12 @@ class ImagePipelineUI(tk.Tk):
 			steps = [
 				("Original",           processed.original_bgr),
 				("White balanced",     processed.white_balanced_bgr),
-				("White mask",         wd.get("white_mask",    processed.white_balanced_bgr)),
-				("Cleaned mask",       wd.get("cleaned_mask",  processed.white_balanced_bgr)),
-				("Distance transform", wd.get("distance",       processed.white_balanced_bgr)),
-				("Mask (pills white)", processed.mask),
-				("Detected pills",     processed.annotated_bgr),
+				("White mask (pre-filter)",         wd.get("white_mask",    processed.white_balanced_bgr)),
+				("Cleaned mask (pre-filter)",       wd.get("cleaned_mask",  processed.white_balanced_bgr)),
+				("Distance transform (pre-filter)", wd.get("distance",       processed.white_balanced_bgr)),
+				("Detected pills (pre-filter)",     wd.get("annotated",      processed.white_balanced_bgr)),
+				("Final mask (post-filter)",        processed.mask),
+				("Final detected pills (post-filter)", processed.annotated_bgr),
 			]
 		else:
 			steps = [
