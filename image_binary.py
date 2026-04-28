@@ -326,10 +326,20 @@ def detect_empty_cells(
 	empty_contours: list = []
 	for grid_y in full_row_ys:
 		for grid_x in col_pos:
-			# Skip positions that already have a detected pill
+			# Skip positions that already have a detected pill (centre-proximity check)
 			if any(
 				abs(px - grid_x) <= match_r and abs(py - grid_y) <= row_tol
 				for px, py in centers
+			):
+				continue
+
+			# Reject if the candidate circle would overlap any real pill contour.
+			# pointPolygonTest returns >= -avg_radius when the point is inside the
+			# contour or within avg_radius pixels of its boundary, meaning the inferred
+			# empty-cell circle would visually overlap the pill — a definite false positive.
+			if any(
+				cv2.pointPolygonTest(cnt, (float(grid_x), float(grid_y)), measureDist=True) >= -avg_radius
+				for cnt in pill_contours
 			):
 				continue
 
