@@ -178,61 +178,74 @@ def detect_empty_cells(
 	bgr: np.ndarray,
 	blister_contour: Optional[np.ndarray],
 	pill_contours: list,
+	gap_multiplier: float = 0.8,
 ) -> Tuple[int, list]:
 	"""
-	Detect empty blister cells by running HoughCircles on the image and keeping
-	only circles whose center falls inside the scan zone (blister interior minus
-	detected pill regions). HoughCircles accumulates votes from partial arcs, so
-	it works even when only part of the dome rim is visible.
+	Detect empty blister cells using HoughCircles, then apply four post-filters:
+	  1. Area filter  — candidate area must be within ±55% of mean pill area.
+	  2. Pill overlap — candidate center must not fall inside any detected pill.
+	  3. Overlap dedup — overlapping candidates keep only the strongest (largest
+	     overlap with scan zone, i.e. highest accumulator-ranked circle).
+	  4. Min spacing  — enforce a minimum gap between accepted candidates equal
+	     to the estimated inter-pill gap (≥ 4 mm worth of pixels, lower-bounded
+	     by avg_radius * 0.25 so it scales with image resolution).
 	"""
 	if not pill_contours:
 		return 0, []
 
 	h, w = bgr.shape[:2]
 
+	# ── Pill size statistics ─────────────────────────────────────────────────
 	areas = [cv2.contourArea(c) for c in pill_contours]
 	avg_area = float(np.mean(areas))
 	if avg_area <= 0:
 		return 0, []
 	avg_radius = max(5, int(np.sqrt(avg_area / np.pi)))
 
-	# Blister interior mask
+	# Filter 1 bounds: candidate circle area must be within ±65 % of avg pill area
+	min_area = avg_area * 0.35
+	max_area = avg_area * 1.65
+
+	# ── Blister interior mask ────────────────────────────────────────────────
 	blister_mask = np.zeros((h, w), dtype=np.uint8)
 	if blister_contour is not None:
 		cv2.drawContours(blister_mask, [blister_contour], -1, 255, -1)
 	else:
 		blister_mask[:] = 255
 
-	# Pill exclusion zone: dilate detected pill regions so we ignore their edges
-	pill_excl = np.zeros((h, w), dtype=np.uint8)
-	cv2.drawContours(pill_excl, pill_contours, -1, 255, -1)
+	# ── Pill exclusion mask (filled pill regions, dilated slightly) ──────────
+	# Used both for the scan zone and for the per-candidate overlap check.
+	pill_filled = np.zeros((h, w), dtype=np.uint8)
+	cv2.drawContours(pill_filled, pill_contours, -1, 255, -1)
+
 	margin = max(3, avg_radius // 5)
 	dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin * 2 + 1, margin * 2 + 1))
-	pill_excl = cv2.dilate(pill_excl, dil_k, iterations=2)
+	pill_excl = cv2.dilate(pill_filled, dil_k, iterations=2)
 
-	# Scan zone: inside blister, not on a detected pill
+	# ── Scan zone: inside blister, not on a detected pill ────────────────────
 	scan_zone = cv2.bitwise_and(blister_mask, cv2.bitwise_not(pill_excl))
 
-	# Moderate blur: suppress fine foil texture (~5px period) but preserve dome-rim edges
+	# ── Moderate blur to suppress fine foil texture ──────────────────────────
 	blur_size = max(7, avg_radius // 4)
 	if blur_size % 2 == 0:
 		blur_size += 1
 	gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 	blurred = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
 
-	# HoughCircles finds all pill-sized circles (filled and empty) in the image.
-	# Empty cells are identified by their center falling in the scan zone.
+	# ── HoughCircles ─────────────────────────────────────────────────────────
 	min_r    = max(5, int(avg_radius * 0.55))
 	max_r    = int(avg_radius * 1.45)
-	min_dist = max(int(avg_radius * 1.5), min_r * 2)
+	# minDist keeps HoughCircles itself from stacking detections; our spacing
+	# filter below handles the final inter-candidate distance constraint.
+	min_dist = max(int(avg_radius * 1.2), min_r * 2)
 
 	circles = cv2.HoughCircles(
 		blurred,
 		cv2.HOUGH_GRADIENT,
 		dp=1,
 		minDist=min_dist,
-		param1=50,   # internal Canny high threshold
-		param2=25,   # accumulator votes required (lower = more sensitive)
+		param1=50,
+		param2=25,
 		minRadius=min_r,
 		maxRadius=max_r,
 	)
@@ -241,19 +254,288 @@ def detect_empty_cells(
 		return 0, []
 
 	circles = np.round(circles[0]).astype(int)
+	# HoughCircles returns circles sorted by accumulator score (best first).
 
-	empty_contours = []
+	# Minimum edge-to-edge gap (pixels) enforced everywhere:
+	#   • between orange circle edge and any detected pill edge
+	#   • between orange circle edge and the blister border
+	#   • between two accepted orange circles
+	min_edge_gap = max(5, int(avg_radius * gap_multiplier))
+
+	# Shared kernel used for both pill and blister-border distance enforcement.
+	pad_k = cv2.getStructuringElement(
+		cv2.MORPH_ELLIPSE,
+		(min_edge_gap * 2 + 1, min_edge_gap * 2 + 1),
+	)
+
+	# pill_padded: pill regions expanded outward by min_edge_gap px.
+	# Any overlap between a candidate circle and this mask means the circle
+	# edge is closer than min_edge_gap to a detected pill → reject.
+	pill_padded = cv2.dilate(pill_filled, pad_k, iterations=1)
+
+	# blister_inner: blister mask shrunk inward by min_edge_gap px.
+	# A candidate circle must be fully contained within this mask, i.e. its
+	# edge must be at least min_edge_gap px away from the blister border.
+	blister_inner = cv2.erode(blister_mask, pad_k, iterations=1)
+
+	accepted: list = []          # (cx, cy, r) tuples that passed all filters
+	empty_contours: list = []    # corresponding contours
+
 	for cx, cy, r in circles:
-		if cx < 0 or cy < 0 or cx >= w or cy >= h:
+		# ── Bounds check ────────────────────────────────────────────────────
+		if not (0 <= cx < w and 0 <= cy < h):
 			continue
+
+		# ── Filter 1: circle area must be within ±65% of mean pill area ─────
+		circle_area = np.pi * r * r
+		if circle_area < min_area or circle_area > max_area:
+			continue
+
+		# ── Filter 2: center must be inside scan zone (not on a pill) ───────
 		if scan_zone[cy, cx] == 0:
 			continue
-		# Convert the detected circle to a contour for drawing
-		tmp = np.zeros((h, w), dtype=np.uint8)
-		cv2.circle(tmp, (cx, cy), r, 255, -1)
-		cnts, _ = cv2.findContours(tmp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+		# ── Build candidate circle mask once; reused by all filters below ────
+		tmp_circle = np.zeros((h, w), dtype=np.uint8)
+		cv2.circle(tmp_circle, (cx, cy), r, 255, -1)
+
+		# ── Filter 3a: enforce min_edge_gap distance from the blister border ───
+		# blister_inner is blister_mask eroded by min_edge_gap px. Any circle
+		# pixel outside it means the circle edge is too close to the blue border.
+		outside_inner = cv2.bitwise_and(tmp_circle, cv2.bitwise_not(blister_inner))
+		if cv2.countNonZero(outside_inner) > 0:
+			continue
+
+		# ── Filter 3b: enforce min_edge_gap distance from every detected pill ─
+		# pill_padded is pill_filled dilated by min_edge_gap px, so any overlap
+		# means the candidate circle edge is closer than min_edge_gap to a pill.
+		if cv2.countNonZero(cv2.bitwise_and(tmp_circle, pill_padded)) > 0:
+			continue
+
+		# ── Filter 4: scan-zone coverage — reject circles wedged between pills
+		# Real empty cells sit in open foil (high scan-zone fraction).
+		# False positives between pills have most of their area eaten by the
+		# dilated pill exclusion mask. Require ≥ 55 % in the scan zone.
+		circle_px = int(cv2.countNonZero(tmp_circle))
+		if circle_px > 0:
+			in_scan = int(cv2.countNonZero(cv2.bitwise_and(tmp_circle, scan_zone)))
+			if in_scan / circle_px < 0.55:
+				continue
+
+		# ── Filter 5: no overlap and min edge gap vs already-accepted circles ─
+		reject = False
+		for ax, ay, ar in accepted:
+			center_dist = float(np.hypot(cx - ax, cy - ay))
+			edge_gap = center_dist - float(r) - float(ar)  # negative = overlap
+
+			if edge_gap < min_edge_gap:   # covers both overlap and too-close
+				reject = True
+				break
+
+		if reject:
+			continue
+
+		# ── Passed all filters — accept ──────────────────────────────────────
+		accepted.append((cx, cy, r))
+		cnts, _ = cv2.findContours(tmp_circle, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 		if cnts:
 			empty_contours.append(cnts[0])
+
+	return len(empty_contours), empty_contours
+
+
+def detect_empty_cells_v2(
+	bgr: np.ndarray,
+	blister_contour: Optional[np.ndarray],
+	pill_contours: list,
+	gap_multiplier: float = 0.8,
+) -> Tuple[int, list]:
+	"""
+	Detect empty blister cells by inferring the pack's grid structure from
+	detected pill positions, then verifying unoccupied grid positions with a
+	foil-colour check.
+
+	Strategy: we already know where pills ARE. A missing pill at an expected
+	grid position — confirmed by the foil's achromatic, medium-brightness
+	signature — is an empty cell.  This sidesteps HoughCircles' partial-arc
+	problem entirely because we never try to reconstruct a circle from edges.
+
+	Border constraint: every inferred empty cell must sit at least as far from
+	the blister contour as the closest real pill does, enforced via
+	cv2.pointPolygonTest (negative = outside; positive = inside at that depth).
+	This single check replaces mask-based approaches that had rounding bugs.
+	"""
+	if not pill_contours:
+		return 0, []
+
+	h, w = bgr.shape[:2]
+
+	# ── Pill statistics ──────────────────────────────────────────────────────
+	areas = [cv2.contourArea(c) for c in pill_contours]
+	avg_area = float(np.mean(areas))
+	if avg_area <= 0:
+		return 0, []
+	avg_radius = max(5, int(np.sqrt(avg_area / np.pi)))
+
+	# ── Pill centres ─────────────────────────────────────────────────────────
+	centers: list = []
+	for cnt in pill_contours:
+		M = cv2.moments(cnt)
+		if M["m00"] > 0:
+			centers.append((float(M["m10"] / M["m00"]), float(M["m01"] / M["m00"])))
+	if len(centers) < 2:
+		return 0, []
+
+	# ── Minimum pill-to-contour distance ─────────────────────────────────────
+	# Computed first so extrapolation can use the same constraint.
+	# pointPolygonTest returns negative for points outside the contour, so any
+	# candidate outside the blister is automatically rejected by >= min_dist.
+	if blister_contour is not None:
+		raw_dists = [
+			cv2.pointPolygonTest(blister_contour, (px, py), measureDist=True)
+			for px, py in centers
+		]
+		valid_dists = [d for d in raw_dists if d > 0]
+		min_border_dist = float(min(valid_dists)) if valid_dists else 0.0
+	else:
+		min_border_dist = 0.0
+
+	def _inside(x: float, y: float) -> bool:
+		"""True iff (x, y) is inside the blister with the required standoff."""
+		xi, yi = int(round(x)), int(round(y))
+		if not (0 <= xi < w and 0 <= yi < h):
+			return False
+		if blister_contour is None:
+			return True
+		d = cv2.pointPolygonTest(blister_contour, (x, y), measureDist=True)
+		return d >= min_border_dist
+
+	# ── Group centres into rows by y-coordinate clustering ───────────────────
+	row_tol = avg_radius * 0.9
+	by_y = sorted(centers, key=lambda c: c[1])
+	rows: list = [[by_y[0]]]
+	for cx, cy in by_y[1:]:
+		row_mean_y = float(np.mean([c[1] for c in rows[-1]]))
+		if abs(cy - row_mean_y) <= row_tol:
+			rows[-1].append((cx, cy))
+		else:
+			rows.append([(cx, cy)])
+	rows = [sorted(r, key=lambda c: c[0]) for r in rows]
+
+	# ── Column spacing: minimum x-gap per row (robust to missing pills) ──────
+	per_row_min_gap: list = []
+	for row in rows:
+		if len(row) >= 2:
+			gaps = [row[i][0] - row[i - 1][0] for i in range(1, len(row))]
+			per_row_min_gap.append(min(gaps))
+	if not per_row_min_gap:
+		return 0, []
+	col_spacing = float(np.median(per_row_min_gap))
+	if col_spacing < avg_radius * 1.2:
+		return 0, []
+
+	# ── Row spacing ──────────────────────────────────────────────────────────
+	row_ys = [float(np.mean([c[1] for c in r])) for r in rows]
+	row_spacing = (
+		float(np.median(np.diff(row_ys))) if len(row_ys) >= 2 else col_spacing
+	)
+	if row_spacing < avg_radius * 1.2:
+		row_spacing = col_spacing
+
+	# ── Global column positions: cluster all pill x-coords ───────────────────
+	all_x = sorted(c[0] for c in centers)
+	col_groups: list = [[all_x[0]]]
+	for x in all_x[1:]:
+		if x - float(np.mean(col_groups[-1])) <= col_spacing * 0.45:
+			col_groups[-1].append(x)
+		else:
+			col_groups.append([x])
+	col_pos = [float(np.mean(g)) for g in col_groups]
+
+	# ── Full row y-grid: interpolate missing interior rows ───────────────────
+	full_row_ys: list = [row_ys[0]]
+	for y in row_ys[1:]:
+		n_fill = round((y - full_row_ys[-1]) / row_spacing) - 1
+		for _ in range(n_fill):
+			full_row_ys.append(full_row_ys[-1] + row_spacing)
+		full_row_ys.append(y)
+
+	# ── Extrapolate rows beyond detected range ────────────────────────────────
+	# _inside() uses pointPolygonTest so it rejects positions outside the
+	# blister contour or within its border margin — no mask rounding issues.
+	mean_col_x = float(np.mean(col_pos))
+	for direction in (-1, 1):
+		y = (full_row_ys[0] if direction == -1 else full_row_ys[-1]) + direction * row_spacing
+		while True:
+			if not _inside(mean_col_x, y):
+				break
+			if direction == -1:
+				full_row_ys.insert(0, y)
+			else:
+				full_row_ys.append(y)
+			y += direction * row_spacing
+
+	# ── Extrapolate columns beyond detected range ─────────────────────────────
+	mean_row_y = float(np.mean(full_row_ys))
+	for direction in (-1, 1):
+		x = (col_pos[0] if direction == -1 else col_pos[-1]) + direction * col_spacing
+		while True:
+			if not _inside(x, mean_row_y):
+				break
+			if direction == -1:
+				col_pos.insert(0, x)
+			else:
+				col_pos.append(x)
+			x += direction * col_spacing
+
+	# ── HSV for foil-colour verification ─────────────────────────────────────
+	hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+	s_ch = hsv[:, :, 1]
+	v_ch = hsv[:, :, 2]
+
+	match_r  = col_spacing * 0.45
+	r_sample = max(3, avg_radius // 4)
+
+	# ── Scan all grid positions; emit confirmed empty cells ───────────────────
+	empty_contours: list = []
+	for grid_y in full_row_ys:
+		for grid_x in col_pos:
+			# Skip positions that already have a detected pill
+			if any(
+				abs(px - grid_x) <= match_r and abs(py - grid_y) <= row_tol
+				for px, py in centers
+			):
+				continue
+
+			# Reject if outside contour or too close to its edge
+			if not _inside(grid_x, grid_y):
+				continue
+
+			cx_i = int(round(grid_x))
+			cy_i = int(round(grid_y))
+
+			# Foil-colour check on a small central patch
+			y0 = max(0, cy_i - r_sample)
+			y1 = min(h, cy_i + r_sample + 1)
+			x0 = max(0, cx_i - r_sample)
+			x1 = min(w, cx_i + r_sample + 1)
+			roi_s = s_ch[y0:y1, x0:x1]
+			roi_v = v_ch[y0:y1, x0:x1]
+			if roi_s.size == 0:
+				continue
+			med_s = float(np.median(roi_s))
+			med_v = float(np.median(roi_v))
+			# Foil: achromatic (S ≤ 70), medium brightness (50 ≤ V ≤ 220)
+			# Rejects: coloured pills (high S), shadows (low V), white pills (V > 220)
+			if med_s > 70 or med_v < 50 or med_v > 220:
+				continue
+
+			# Emit a circle contour at the inferred empty position
+			tmp = np.zeros((h, w), dtype=np.uint8)
+			cv2.circle(tmp, (cx_i, cy_i), avg_radius, 255, -1)
+			cnts, _ = cv2.findContours(tmp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+			if cnts:
+				empty_contours.append(cnts[0])
 
 	return len(empty_contours), empty_contours
 
@@ -578,6 +860,7 @@ def process_image(
 	wp_min_area: float,
 	wp_solidity: float,
 	wp_brightness_floor: int,
+	gap_multiplier: float = 0.8,
 ) -> ProcessedImages:
 	bgr = cv2.imread(str(image_path))
 	if bgr is None:
@@ -613,7 +896,7 @@ def process_image(
 			cv2.drawContours(annotated, [blister_contour], -1, (255, 0, 0), 3)
 		if contours:
 			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
-		empty_count, empty_contours = detect_empty_cells(white_balanced, blister_contour, contours)
+		empty_count, empty_contours = detect_empty_cells_v2(white_balanced, blister_contour, contours, gap_multiplier)
 		if empty_contours:
 			cv2.drawContours(annotated, empty_contours, -1, (0, 165, 255), 3)
 
@@ -644,7 +927,7 @@ def process_image(
 			cv2.drawContours(annotated, [blister_contour], -1, (255, 0, 0), 3)
 		if contours:
 			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
-		empty_count, empty_contours = detect_empty_cells(white_balanced, blister_contour, contours)
+		empty_count, empty_contours = detect_empty_cells_v2(white_balanced, blister_contour, contours, gap_multiplier)
 		if empty_contours:
 			cv2.drawContours(annotated, empty_contours, -1, (0, 165, 255), 3)
 		white_debug = wp_result.debug_images
@@ -730,6 +1013,8 @@ class ImagePipelineUI(tk.Tk):
 		self._wp_separation       = tk.DoubleVar(value=0.40)
 		self._wp_min_area         = tk.DoubleVar(value=0.30)
 		self._wp_solidity         = tk.DoubleVar(value=0.50)
+		# ── Empty-cell detection ──────────────────────────────────────
+		self._gap_multiplier      = tk.DoubleVar(value=0.8)
 
 		self._build_layout()
 		self._run_pipeline()
@@ -763,6 +1048,15 @@ class ImagePipelineUI(tk.Tk):
 		self._empty_oval   = self._empty_canvas.create_oval(1, 1, 17, 17, fill="green", outline="#555")
 		self._empty_canvas.pack(side="right", padx=(4, 0))
 		ttk.Label(lights_frame, text="Empty cells").pack(side="right")
+
+		ttk.Label(lights_frame, text="   ").pack(side="right")
+		ttk.Spinbox(
+			lights_frame,
+			from_=0.1, to=5.0, increment=0.1, width=5, format="%.1f",
+			textvariable=self._gap_multiplier,
+			command=self._schedule_update,
+		).pack(side="right")
+		ttk.Label(lights_frame, text="Gap ×:").pack(side="right")
 		ttk.Button(btn_group, text="Previous",   command=self._prev_image).pack(side="left", padx=(0, 6))
 		ttk.Button(btn_group, text="Next",        command=self._next_image).pack(side="left", padx=(0, 6))
 		ttk.Button(btn_group, text="Open Image",  command=self._open_image).pack(side="left")
@@ -980,6 +1274,7 @@ class ImagePipelineUI(tk.Tk):
 			wp_min_area          = float(self._wp_min_area.get()),
 			wp_solidity          = float(self._wp_solidity.get()),
 			wp_brightness_floor  = int(self._wp_brightness_floor.get()),
+			gap_multiplier       = float(self._gap_multiplier.get()),
 		)
 
 		self.count_label.configure(text=f"Pills: {processed.pill_count}")
