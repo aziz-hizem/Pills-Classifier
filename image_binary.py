@@ -18,7 +18,6 @@ from white_pill_segmentor import segment_white_pills
 @dataclass
 class ProcessedImages:
 	original_bgr: np.ndarray
-	rectified_bgr: np.ndarray
 	white_balanced_bgr: np.ndarray
 	color_debug_mask: np.ndarray
 	mask: np.ndarray
@@ -27,10 +26,12 @@ class ProcessedImages:
 	pill_count: int
 	color_class: "PillColorClass"
 	median_saturation: float
-	dominant_hue: float
 	sample_pixel_ratio: float
 	color_name: str
 	white_debug_images: Optional[Dict[str, np.ndarray]] = field(default=None)
+	empty_cell_count: int = 0
+	empty_cell_contours: list = field(default_factory=list)
+	color_anomaly: bool = False
 
 
 class PillColorClass(Enum):
@@ -170,6 +171,328 @@ def detect_blister_contour(bgr: np.ndarray) -> Optional[np.ndarray]:
 	rect = cv2.minAreaRect(hull)
 	box = cv2.boxPoints(rect)
 	return box.astype("int32").reshape(-1, 1, 2)
+
+
+def detect_empty_cells(
+	bgr: np.ndarray,
+	blister_contour: Optional[np.ndarray],
+	pill_contours: list,
+) -> Tuple[int, list]:
+	"""
+	Detect empty blister cells by inferring the pack's grid structure from
+	detected pill positions, then verifying unoccupied grid positions with a
+	foil-colour check.
+
+	Strategy: we already know where pills ARE. A missing pill at an expected
+	grid position — confirmed by the foil's achromatic, medium-brightness
+	signature — is an empty cell.
+
+	Border constraint: every inferred empty cell must sit at least as far from
+	the blister contour as the closest real pill does, enforced via
+	cv2.pointPolygonTest (negative = outside; positive = inside at that depth).
+	"""
+	if not pill_contours:
+		return 0, []
+
+	h, w = bgr.shape[:2]
+
+	# ── Pill statistics ──────────────────────────────────────────────────────
+	areas = [cv2.contourArea(c) for c in pill_contours]
+	avg_area = float(np.mean(areas))
+	if avg_area <= 0:
+		return 0, []
+	avg_radius = max(5, int(np.sqrt(avg_area / np.pi)))
+
+	# ── Pill centres ─────────────────────────────────────────────────────────
+	centers: list = []
+	for cnt in pill_contours:
+		M = cv2.moments(cnt)
+		if M["m00"] > 0:
+			centers.append((float(M["m10"] / M["m00"]), float(M["m01"] / M["m00"])))
+	if len(centers) < 2:
+		return 0, []
+
+	# ── Minimum pill-to-contour distance ─────────────────────────────────────
+	# Computed first so extrapolation can use the same constraint.
+	# pointPolygonTest returns negative for points outside the contour, so any
+	# candidate outside the blister is automatically rejected by >= min_dist.
+	if blister_contour is not None:
+		raw_dists = [
+			cv2.pointPolygonTest(blister_contour, (px, py), measureDist=True)
+			for px, py in centers
+		]
+		valid_dists = [d for d in raw_dists if d > 0]
+		min_border_dist = float(min(valid_dists)) if valid_dists else 0.0
+	else:
+		min_border_dist = 0.0
+
+	def _inside(x: float, y: float) -> bool:
+		"""True iff (x, y) is inside the blister with the required standoff."""
+		xi, yi = int(round(x)), int(round(y))
+		if not (0 <= xi < w and 0 <= yi < h):
+			return False
+		if blister_contour is None:
+			return True
+		d = cv2.pointPolygonTest(blister_contour, (x, y), measureDist=True)
+		return d >= min_border_dist
+
+	# ── Group centres into rows by y-coordinate clustering ───────────────────
+	row_tol = avg_radius * 0.9
+	by_y = sorted(centers, key=lambda c: c[1])
+	rows: list = [[by_y[0]]]
+	for cx, cy in by_y[1:]:
+		row_mean_y = float(np.mean([c[1] for c in rows[-1]]))
+		if abs(cy - row_mean_y) <= row_tol:
+			rows[-1].append((cx, cy))
+		else:
+			rows.append([(cx, cy)])
+	rows = [sorted(r, key=lambda c: c[0]) for r in rows]
+
+	# ── Column spacing: minimum x-gap per row (robust to missing pills) ──────
+	per_row_min_gap: list = []
+	for row in rows:
+		if len(row) >= 2:
+			gaps = [row[i][0] - row[i - 1][0] for i in range(1, len(row))]
+			per_row_min_gap.append(min(gaps))
+	if not per_row_min_gap:
+		return 0, []
+	col_spacing = float(np.median(per_row_min_gap))
+	if col_spacing < avg_radius * 1.2:
+		return 0, []
+
+	# ── Row spacing ──────────────────────────────────────────────────────────
+	row_ys = [float(np.mean([c[1] for c in r])) for r in rows]
+	row_spacing = (
+		float(np.median(np.diff(row_ys))) if len(row_ys) >= 2 else col_spacing
+	)
+	if row_spacing < avg_radius * 1.2:
+		row_spacing = col_spacing
+
+	# ── Global column positions: cluster all pill x-coords ───────────────────
+	all_x = sorted(c[0] for c in centers)
+	col_groups: list = [[all_x[0]]]
+	for x in all_x[1:]:
+		if x - float(np.mean(col_groups[-1])) <= col_spacing * 0.45:
+			col_groups[-1].append(x)
+		else:
+			col_groups.append([x])
+	col_pos = [float(np.mean(g)) for g in col_groups]
+
+	# ── Full row y-grid: interpolate missing interior rows ───────────────────
+	full_row_ys: list = [row_ys[0]]
+	for y in row_ys[1:]:
+		n_fill = round((y - full_row_ys[-1]) / row_spacing) - 1
+		for _ in range(n_fill):
+			full_row_ys.append(full_row_ys[-1] + row_spacing)
+		full_row_ys.append(y)
+
+	# ── Extrapolate rows beyond detected range ────────────────────────────────
+	# _inside() uses pointPolygonTest so it rejects positions outside the
+	# blister contour or within its border margin — no mask rounding issues.
+	mean_col_x = float(np.mean(col_pos))
+	for direction in (-1, 1):
+		y = (full_row_ys[0] if direction == -1 else full_row_ys[-1]) + direction * row_spacing
+		while True:
+			if not _inside(mean_col_x, y):
+				break
+			if direction == -1:
+				full_row_ys.insert(0, y)
+			else:
+				full_row_ys.append(y)
+			y += direction * row_spacing
+
+	# ── Extrapolate columns beyond detected range ─────────────────────────────
+	mean_row_y = float(np.mean(full_row_ys))
+	for direction in (-1, 1):
+		x = (col_pos[0] if direction == -1 else col_pos[-1]) + direction * col_spacing
+		while True:
+			if not _inside(x, mean_row_y):
+				break
+			if direction == -1:
+				col_pos.insert(0, x)
+			else:
+				col_pos.append(x)
+			x += direction * col_spacing
+
+	# ── HSV for foil-colour verification ─────────────────────────────────────
+	hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+	s_ch = hsv[:, :, 1]
+	v_ch = hsv[:, :, 2]
+
+	match_r  = col_spacing * 0.45
+	r_sample = max(3, avg_radius // 4)
+
+	# ── Scan all grid positions; emit confirmed empty cells ───────────────────
+	empty_contours: list = []
+	for grid_y in full_row_ys:
+		for grid_x in col_pos:
+			# Skip positions that already have a detected pill (centre-proximity check)
+			if any(
+				abs(px - grid_x) <= match_r and abs(py - grid_y) <= row_tol
+				for px, py in centers
+			):
+				continue
+
+			# Reject if the candidate circle would overlap any real pill contour.
+			# pointPolygonTest returns >= -avg_radius when the point is inside the
+			# contour or within avg_radius pixels of its boundary, meaning the inferred
+			# empty-cell circle would visually overlap the pill — a definite false positive.
+			if any(
+				cv2.pointPolygonTest(cnt, (float(grid_x), float(grid_y)), measureDist=True) >= -avg_radius
+				for cnt in pill_contours
+			):
+				continue
+
+			# Reject if outside contour or too close to its edge
+			if not _inside(grid_x, grid_y):
+				continue
+
+			cx_i = int(round(grid_x))
+			cy_i = int(round(grid_y))
+
+			# Foil-colour check on a small central patch
+			y0 = max(0, cy_i - r_sample)
+			y1 = min(h, cy_i + r_sample + 1)
+			x0 = max(0, cx_i - r_sample)
+			x1 = min(w, cx_i + r_sample + 1)
+			roi_s = s_ch[y0:y1, x0:x1]
+			roi_v = v_ch[y0:y1, x0:x1]
+			if roi_s.size == 0:
+				continue
+			med_s = float(np.median(roi_s))
+			med_v = float(np.median(roi_v))
+			# Foil: achromatic (S ≤ 70), medium brightness (50 ≤ V ≤ 220)
+			# Rejects: coloured pills (high S), shadows (low V), white pills (V > 220)
+			if med_s > 70 or med_v < 50 or med_v > 220:
+				continue
+
+			# Emit a circle contour at the inferred empty position
+			tmp = np.zeros((h, w), dtype=np.uint8)
+			cv2.circle(tmp, (cx_i, cy_i), avg_radius, 255, -1)
+			cnts, _ = cv2.findContours(tmp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+			if cnts:
+				empty_contours.append(cnts[0])
+
+	return len(empty_contours), empty_contours
+
+
+def detect_color_anomaly(
+	bgr: np.ndarray,
+	pill_contours: list,
+	color_class: "PillColorClass",
+	hue_threshold: float = 25.0,
+	min_sat_for_hue: int = 40,
+	min_valid_pixels: int = 20,
+	white_sat_spike: float = 40.0,
+	colored_sat_spike: float = 45.0,
+) -> bool:
+	if color_class == PillColorClass.UNKNOWN or len(pill_contours) < 2:
+		return False
+	hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+	h_chan = hsv[:, :, 0]
+	s_chan = hsv[:, :, 1]
+	mask_buf = np.zeros(bgr.shape[:2], dtype=np.uint8)
+	per_pill_hues: list = []
+	per_pill_sats: list = []
+	for cnt in pill_contours:
+		mask_buf[:] = 0
+		cv2.drawContours(mask_buf, [cnt], -1, 255, -1)
+		pixels = mask_buf == 255
+		if int(pixels.sum()) < min_valid_pixels:
+			continue
+		per_pill_sats.append(float(np.median(s_chan[pixels])))
+		if color_class == PillColorClass.COLORED:
+			valid = pixels & (s_chan >= min_sat_for_hue)
+			if int(valid.sum()) < min_valid_pixels:
+				continue
+			hues = h_chan[valid]
+			angles = hues * (2.0 * np.pi / 180.0)
+			circ = float(np.angle(np.mean(np.exp(1j * angles))) * 180.0 / (2.0 * np.pi))
+			if circ < 0:
+				circ += 180.0
+			per_pill_hues.append(circ)
+	if color_class == PillColorClass.COLORED:
+		# Saturation check: catches cream/achromatic pills mixed with saturated colored ones
+		if len(per_pill_sats) >= 2:
+			median_sat = float(np.median(per_pill_sats))
+			if any(abs(s - median_sat) > colored_sat_spike for s in per_pill_sats):
+				return True
+		if len(per_pill_hues) < 2:
+			return False
+		# Color-name check: catches adjacent-spectrum colors like yellow vs green whose
+		# hue distance (≈20 OpenCV units) is too small for a numeric threshold to catch reliably.
+		pill_names = [hue_to_color_name(h) for h in per_pill_hues]
+		if len(set(pill_names)) > 1:
+			return True
+		# Hue-distance fallback: catches large within-category spread
+		angles = np.array(per_pill_hues) * (2.0 * np.pi / 180.0)
+		consensus_angle = float(np.angle(np.mean(np.exp(1j * angles))))
+		consensus_hue = consensus_angle * 180.0 / (2.0 * np.pi)
+		if consensus_hue < 0:
+			consensus_hue += 180.0
+		for h in per_pill_hues:
+			d = abs(h - consensus_hue)
+			if min(d, 180.0 - d) > hue_threshold:
+				return True
+		return False
+	else:
+		if len(per_pill_sats) < 2:
+			return False
+		median_sat = float(np.median(per_pill_sats))
+		return any(s > median_sat + white_sat_spike for s in per_pill_sats)
+
+
+def _pill_color_letters(
+	bgr: np.ndarray,
+	pill_contours: list,
+	color_class: PillColorClass,
+	min_sat_for_hue: int = 40,
+	min_valid_pixels: int = 20,
+) -> list:
+	if not pill_contours:
+		return []
+	hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+	h_chan = hsv[:, :, 0]
+	s_chan = hsv[:, :, 1]
+	mask_buf = np.zeros(bgr.shape[:2], dtype=np.uint8)
+	letters = []
+	for cnt in pill_contours:
+		mask_buf[:] = 0
+		cv2.drawContours(mask_buf, [cnt], -1, 255, -1)
+		pixels = mask_buf == 255
+		if int(pixels.sum()) < min_valid_pixels:
+			letters.append("?")
+			continue
+		if color_class == PillColorClass.WHITE:
+			med_sat = float(np.median(s_chan[pixels]))
+			if med_sat < min_sat_for_hue:
+				letters.append("W")
+				continue
+		valid = pixels & (s_chan >= min_sat_for_hue)
+		if int(valid.sum()) < min_valid_pixels:
+			letters.append("W" if color_class == PillColorClass.WHITE else "?")
+			continue
+		hues = h_chan[valid]
+		angles = hues * (2.0 * np.pi / 180.0)
+		circ = float(np.angle(np.mean(np.exp(1j * angles))) * 180.0 / (2.0 * np.pi))
+		if circ < 0:
+			circ += 180.0
+		letters.append(hue_to_color_name(circ)[0].upper())
+	return letters
+
+
+def _draw_pill_letters(image: np.ndarray, contours: list, letters: list) -> None:
+	for cnt, letter in zip(contours, letters):
+		M = cv2.moments(cnt)
+		if M["m00"] == 0:
+			continue
+		cx = int(M["m10"] / M["m00"])
+		cy = int(M["m01"] / M["m00"])
+		_, _, w, h = cv2.boundingRect(cnt)
+		scale = max(0.3, min(0.9, min(w, h) / 50.0))
+		(tw, th), _ = cv2.getTextSize(letter, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+		cv2.putText(image, letter, (cx - tw // 2, cy + th // 2),
+					cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2, cv2.LINE_AA)
 
 
 def _contour_mask(shape: Tuple[int, int, int], contour: Optional[np.ndarray]) -> np.ndarray:
@@ -358,11 +681,11 @@ def hue_to_color_name(hue_degrees: float) -> str:
 	h = hue_degrees * 2.0  # convert to full 0–360° range
 	if h < 15 or h >= 345:
 		return "red"
-	if h < 45:
+	if h < 38:   # was 45; pastel yellow (~40°) was wrongly classified as orange
 		return "orange"
-	if h < 75:
+	if h < 70:   # was 85; lime-green (~80°) was wrongly classified as yellow
 		return "yellow"
-	if h < 150:
+	if h < 155:
 		return "green"
 	if h < 195:
 		return "cyan"
@@ -504,11 +827,13 @@ def process_image(
 	contour_mask = _contour_mask(rectified.shape, blister_contour)
 
 	# Initialise outputs — overwritten by whichever path runs
-	pill_mask    = np.zeros(rectified.shape[:2], dtype=np.uint8)
-	count        = 0
-	contours     = []
-	annotated    = white_balanced.copy()
+	pill_mask      = np.zeros(rectified.shape[:2], dtype=np.uint8)
+	count          = 0
+	contours       = []
+	annotated      = white_balanced.copy()
 	white_debug: Dict[str, np.ndarray] = {}
+	empty_count    = 0
+	empty_contours: list = []
 
 	if color_result.color_class == PillColorClass.COLORED:
 		pill_mask = _segment_pills(
@@ -521,8 +846,14 @@ def process_image(
 			min_circularity=min_circularity,
 			stddev_max=stddev_max,
 		)
+		if blister_contour is not None:
+			cv2.drawContours(annotated, [blister_contour], -1, (255, 0, 0), 3)
 		if contours:
 			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
+			_draw_pill_letters(annotated, contours, _pill_color_letters(white_balanced, contours, color_result.color_class))
+		empty_count, empty_contours = detect_empty_cells(white_balanced, blister_contour, contours)
+		if empty_contours:
+			cv2.drawContours(annotated, empty_contours, -1, (0, 165, 255), 3)
 
 	elif color_result.color_class == PillColorClass.WHITE:
 		search_mask = (
@@ -551,6 +882,10 @@ def process_image(
 			cv2.drawContours(annotated, [blister_contour], -1, (255, 0, 0), 3)
 		if contours:
 			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
+			_draw_pill_letters(annotated, contours, _pill_color_letters(white_balanced, contours, color_result.color_class))
+		empty_count, empty_contours = detect_empty_cells(white_balanced, blister_contour, contours)
+		if empty_contours:
+			cv2.drawContours(annotated, empty_contours, -1, (0, 165, 255), 3)
 		white_debug = wp_result.debug_images
 
 	# UNKNOWN: all outputs stay at safe empty defaults set above
@@ -560,10 +895,10 @@ def process_image(
 		hue_to_color_name(color_result.dominant_hue)
 		if color_result.color_class == PillColorClass.COLORED else ""
 	)
+	color_anomaly = detect_color_anomaly(white_balanced, contours, color_result.color_class)
 
 	return ProcessedImages(
 		original_bgr        = bgr,
-		rectified_bgr       = rectified,
 		white_balanced_bgr  = white_balanced,
 		color_debug_mask    = color_result.debug_mask,
 		mask                = pill_mask,
@@ -572,10 +907,12 @@ def process_image(
 		pill_count          = count,
 		color_class         = color_result.color_class,
 		median_saturation   = color_result.median_saturation,
-		dominant_hue        = color_result.dominant_hue,
 		sample_pixel_ratio  = color_result.sample_pixel_ratio,
 		color_name          = color_name,
 		white_debug_images  = white_debug or None,
+		empty_cell_count    = empty_count,
+		empty_cell_contours = empty_contours,
+		color_anomaly       = color_anomaly,
 	)
 
 
@@ -632,7 +969,6 @@ class ImagePipelineUI(tk.Tk):
 		self._wp_separation       = tk.DoubleVar(value=0.40)
 		self._wp_min_area         = tk.DoubleVar(value=0.30)
 		self._wp_solidity         = tk.DoubleVar(value=0.50)
-
 		self._build_layout()
 		self._run_pipeline()
 
@@ -649,6 +985,24 @@ class ImagePipelineUI(tk.Tk):
 
 		btn_group = ttk.Frame(header)
 		btn_group.pack(side="right")
+
+		# Status lights (packed right-to-left, so declare right first)
+		lights_frame = ttk.Frame(header)
+		lights_frame.pack(side="right", padx=(0, 16))
+
+		self._color_canvas = tk.Canvas(lights_frame, width=18, height=18, highlightthickness=0)
+		self._color_oval   = self._color_canvas.create_oval(1, 1, 17, 17, fill="green", outline="#555")
+		self._color_canvas.pack(side="right", padx=(4, 0))
+		ttk.Label(lights_frame, text="Color anomaly").pack(side="right")
+
+		ttk.Label(lights_frame, text="   ").pack(side="right")
+
+		self._empty_canvas = tk.Canvas(lights_frame, width=18, height=18, highlightthickness=0)
+		self._empty_oval   = self._empty_canvas.create_oval(1, 1, 17, 17, fill="green", outline="#555")
+		self._empty_canvas.pack(side="right", padx=(4, 0))
+		ttk.Label(lights_frame, text="Empty cells").pack(side="right")
+
+		ttk.Label(lights_frame, text="   ").pack(side="right")
 		ttk.Button(btn_group, text="Previous",   command=self._prev_image).pack(side="left", padx=(0, 6))
 		ttk.Button(btn_group, text="Next",        command=self._next_image).pack(side="left", padx=(0, 6))
 		ttk.Button(btn_group, text="Open Image",  command=self._open_image).pack(side="left")
@@ -870,6 +1224,11 @@ class ImagePipelineUI(tk.Tk):
 
 		self.count_label.configure(text=f"Pills: {processed.pill_count}")
 		self._update_color_label(processed)
+
+		empty_light = "red" if processed.empty_cell_count > 0 else "green"
+		self._empty_canvas.itemconfigure(self._empty_oval, fill=empty_light)
+		anomaly_light = "red" if processed.color_anomaly else "green"
+		self._color_canvas.itemconfigure(self._color_oval, fill=anomaly_light)
 
 		# Adaptive panel set: white path shows texture debug; colored path shows standard
 		if processed.color_class == PillColorClass.WHITE and processed.white_debug_images:
