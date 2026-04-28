@@ -31,6 +31,7 @@ class ProcessedImages:
 	white_debug_images: Optional[Dict[str, np.ndarray]] = field(default=None)
 	empty_cell_count: int = 0
 	empty_cell_contours: list = field(default_factory=list)
+	color_anomaly: bool = False
 
 
 class PillColorClass(Enum):
@@ -365,6 +366,125 @@ def detect_empty_cells(
 	return len(empty_contours), empty_contours
 
 
+def detect_color_anomaly(
+	bgr: np.ndarray,
+	pill_contours: list,
+	color_class: "PillColorClass",
+	hue_threshold: float = 25.0,
+	min_sat_for_hue: int = 40,
+	min_valid_pixels: int = 20,
+	white_sat_spike: float = 40.0,
+	colored_sat_spike: float = 45.0,
+) -> bool:
+	if color_class == PillColorClass.UNKNOWN or len(pill_contours) < 2:
+		return False
+	hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+	h_chan = hsv[:, :, 0]
+	s_chan = hsv[:, :, 1]
+	mask_buf = np.zeros(bgr.shape[:2], dtype=np.uint8)
+	per_pill_hues: list = []
+	per_pill_sats: list = []
+	for cnt in pill_contours:
+		mask_buf[:] = 0
+		cv2.drawContours(mask_buf, [cnt], -1, 255, -1)
+		pixels = mask_buf == 255
+		if int(pixels.sum()) < min_valid_pixels:
+			continue
+		per_pill_sats.append(float(np.median(s_chan[pixels])))
+		if color_class == PillColorClass.COLORED:
+			valid = pixels & (s_chan >= min_sat_for_hue)
+			if int(valid.sum()) < min_valid_pixels:
+				continue
+			hues = h_chan[valid]
+			angles = hues * (2.0 * np.pi / 180.0)
+			circ = float(np.angle(np.mean(np.exp(1j * angles))) * 180.0 / (2.0 * np.pi))
+			if circ < 0:
+				circ += 180.0
+			per_pill_hues.append(circ)
+	if color_class == PillColorClass.COLORED:
+		# Saturation check: catches cream/achromatic pills mixed with saturated colored ones
+		if len(per_pill_sats) >= 2:
+			median_sat = float(np.median(per_pill_sats))
+			if any(abs(s - median_sat) > colored_sat_spike for s in per_pill_sats):
+				return True
+		if len(per_pill_hues) < 2:
+			return False
+		# Color-name check: catches adjacent-spectrum colors like yellow vs green whose
+		# hue distance (≈20 OpenCV units) is too small for a numeric threshold to catch reliably.
+		pill_names = [hue_to_color_name(h) for h in per_pill_hues]
+		if len(set(pill_names)) > 1:
+			return True
+		# Hue-distance fallback: catches large within-category spread
+		angles = np.array(per_pill_hues) * (2.0 * np.pi / 180.0)
+		consensus_angle = float(np.angle(np.mean(np.exp(1j * angles))))
+		consensus_hue = consensus_angle * 180.0 / (2.0 * np.pi)
+		if consensus_hue < 0:
+			consensus_hue += 180.0
+		for h in per_pill_hues:
+			d = abs(h - consensus_hue)
+			if min(d, 180.0 - d) > hue_threshold:
+				return True
+		return False
+	else:
+		if len(per_pill_sats) < 2:
+			return False
+		median_sat = float(np.median(per_pill_sats))
+		return any(s > median_sat + white_sat_spike for s in per_pill_sats)
+
+
+def _pill_color_letters(
+	bgr: np.ndarray,
+	pill_contours: list,
+	color_class: PillColorClass,
+	min_sat_for_hue: int = 40,
+	min_valid_pixels: int = 20,
+) -> list:
+	if not pill_contours:
+		return []
+	hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+	h_chan = hsv[:, :, 0]
+	s_chan = hsv[:, :, 1]
+	mask_buf = np.zeros(bgr.shape[:2], dtype=np.uint8)
+	letters = []
+	for cnt in pill_contours:
+		mask_buf[:] = 0
+		cv2.drawContours(mask_buf, [cnt], -1, 255, -1)
+		pixels = mask_buf == 255
+		if int(pixels.sum()) < min_valid_pixels:
+			letters.append("?")
+			continue
+		if color_class == PillColorClass.WHITE:
+			med_sat = float(np.median(s_chan[pixels]))
+			if med_sat < min_sat_for_hue:
+				letters.append("W")
+				continue
+		valid = pixels & (s_chan >= min_sat_for_hue)
+		if int(valid.sum()) < min_valid_pixels:
+			letters.append("W" if color_class == PillColorClass.WHITE else "?")
+			continue
+		hues = h_chan[valid]
+		angles = hues * (2.0 * np.pi / 180.0)
+		circ = float(np.angle(np.mean(np.exp(1j * angles))) * 180.0 / (2.0 * np.pi))
+		if circ < 0:
+			circ += 180.0
+		letters.append(hue_to_color_name(circ)[0].upper())
+	return letters
+
+
+def _draw_pill_letters(image: np.ndarray, contours: list, letters: list) -> None:
+	for cnt, letter in zip(contours, letters):
+		M = cv2.moments(cnt)
+		if M["m00"] == 0:
+			continue
+		cx = int(M["m10"] / M["m00"])
+		cy = int(M["m01"] / M["m00"])
+		_, _, w, h = cv2.boundingRect(cnt)
+		scale = max(0.3, min(0.9, min(w, h) / 50.0))
+		(tw, th), _ = cv2.getTextSize(letter, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+		cv2.putText(image, letter, (cx - tw // 2, cy + th // 2),
+					cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2, cv2.LINE_AA)
+
+
 def _contour_mask(shape: Tuple[int, int, int], contour: Optional[np.ndarray]) -> np.ndarray:
 	mask = np.zeros(shape[:2], dtype=np.uint8)
 	if contour is None:
@@ -551,11 +671,11 @@ def hue_to_color_name(hue_degrees: float) -> str:
 	h = hue_degrees * 2.0  # convert to full 0–360° range
 	if h < 15 or h >= 345:
 		return "red"
-	if h < 45:
+	if h < 38:   # was 45; pastel yellow (~40°) was wrongly classified as orange
 		return "orange"
-	if h < 75:
+	if h < 70:   # was 85; lime-green (~80°) was wrongly classified as yellow
 		return "yellow"
-	if h < 150:
+	if h < 155:
 		return "green"
 	if h < 195:
 		return "cyan"
@@ -720,6 +840,7 @@ def process_image(
 			cv2.drawContours(annotated, [blister_contour], -1, (255, 0, 0), 3)
 		if contours:
 			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
+			_draw_pill_letters(annotated, contours, _pill_color_letters(white_balanced, contours, color_result.color_class))
 		empty_count, empty_contours = detect_empty_cells(white_balanced, blister_contour, contours)
 		if empty_contours:
 			cv2.drawContours(annotated, empty_contours, -1, (0, 165, 255), 3)
@@ -751,6 +872,7 @@ def process_image(
 			cv2.drawContours(annotated, [blister_contour], -1, (255, 0, 0), 3)
 		if contours:
 			cv2.drawContours(annotated, contours, -1, (0, 0, 255), 2)
+			_draw_pill_letters(annotated, contours, _pill_color_letters(white_balanced, contours, color_result.color_class))
 		empty_count, empty_contours = detect_empty_cells(white_balanced, blister_contour, contours)
 		if empty_contours:
 			cv2.drawContours(annotated, empty_contours, -1, (0, 165, 255), 3)
@@ -763,6 +885,7 @@ def process_image(
 		hue_to_color_name(color_result.dominant_hue)
 		if color_result.color_class == PillColorClass.COLORED else ""
 	)
+	color_anomaly = detect_color_anomaly(white_balanced, contours, color_result.color_class)
 
 	return ProcessedImages(
 		original_bgr        = bgr,
@@ -779,6 +902,7 @@ def process_image(
 		white_debug_images  = white_debug or None,
 		empty_cell_count    = empty_count,
 		empty_cell_contours = empty_contours,
+		color_anomaly       = color_anomaly,
 	)
 
 
@@ -1093,7 +1217,8 @@ class ImagePipelineUI(tk.Tk):
 
 		empty_light = "red" if processed.empty_cell_count > 0 else "green"
 		self._empty_canvas.itemconfigure(self._empty_oval, fill=empty_light)
-		self._color_canvas.itemconfigure(self._color_oval, fill="green")  # placeholder
+		anomaly_light = "red" if processed.color_anomaly else "green"
+		self._color_canvas.itemconfigure(self._color_oval, fill=anomaly_light)
 
 		# Adaptive panel set: white path shows texture debug; colored path shows standard
 		if processed.color_class == PillColorClass.WHITE and processed.white_debug_images:
