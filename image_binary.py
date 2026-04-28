@@ -949,26 +949,23 @@ class ImagePipelineUI(tk.Tk):
 		self._image_paths = image_paths if image_paths is not None else self._load_images_from_folder()
 		self._image_index = self._resolve_image_index(image_path)
 		self._update_job  = None
-		self._colored_visible = False
-		self._white_visible = False
 
-		# ── Colored-pill sliders ──────────────────────────────────────
-		self._clahe_clip      = tk.DoubleVar(value=2.0)
-		self._sat_thresh      = tk.DoubleVar(value=35.0)
-		self._val_dark        = tk.DoubleVar(value=80.0)
-		self._adaptive_block  = tk.IntVar(value=35)
-		self._adaptive_c      = tk.DoubleVar(value=15.0)
-		self._separation      = tk.DoubleVar(value=0.45)
-		self._min_area        = tk.DoubleVar(value=0.20)
-		self._min_circularity = tk.DoubleVar(value=0.15)
-		self._stddev_max      = tk.DoubleVar(value=0.0)
-		# ── White-pill sliders ────────────────────────────────────────
-		self._wp_brightness_floor = tk.DoubleVar(value=205.0)
-		self._morph_open          = tk.IntVar(value=1)
-		self._morph_close         = tk.IntVar(value=3)
-		self._wp_separation       = tk.DoubleVar(value=0.40)
-		self._wp_min_area         = tk.DoubleVar(value=0.30)
-		self._wp_solidity         = tk.DoubleVar(value=0.50)
+		# ── Fixed parameters (former slider defaults) ───────────────────
+		self._clahe_clip = 2.0
+		self._sat_thresh = 35.0
+		self._val_dark = 80.0
+		self._adaptive_block = 35
+		self._adaptive_c = 15.0
+		self._separation = 0.45
+		self._min_area = 0.20
+		self._min_circularity = 0.15
+		self._stddev_max = 0.0
+		self._wp_brightness_floor = 205.0
+		self._morph_open = 1
+		self._morph_close = 3
+		self._wp_separation = 0.40
+		self._wp_min_area = 0.30
+		self._wp_solidity = 0.50
 		self._build_layout()
 		self._run_pipeline()
 
@@ -1006,82 +1003,6 @@ class ImagePipelineUI(tk.Tk):
 		ttk.Button(btn_group, text="Previous",   command=self._prev_image).pack(side="left", padx=(0, 6))
 		ttk.Button(btn_group, text="Next",        command=self._next_image).pack(side="left", padx=(0, 6))
 		ttk.Button(btn_group, text="Open Image",  command=self._open_image).pack(side="left")
-
-		controls = ttk.Frame(self)
-		controls.pack(fill="x", padx=12, pady=(0, 8))
-
-		def slider_row(parent, row, label_var, text, from_, to, var) -> None:
-			label_var.configure(text=text)
-			label_var.grid(row=row, column=0, sticky="w")
-			ttk.Scale(
-				parent,
-				from_=from_,
-				to=to,
-				variable=var,
-				command=self._schedule_update,
-			).grid(row=row, column=1, sticky="ew", padx=8)
-
-		colored_header = ttk.Frame(controls)
-		colored_header.grid(row=0, column=0, columnspan=2, sticky="ew")
-		ttk.Label(colored_header, text="Colored pill settings", font=("Segoe UI", 9, "bold")).pack(
-			side="left"
-		)
-		self._colored_toggle = ttk.Button(colored_header, text="Show", command=self._toggle_colored)
-		self._colored_toggle.pack(side="right")
-
-		self._colored_frame = ttk.Frame(controls)
-		self._colored_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
-		self._colored_frame.grid_remove()
-
-		self.sat_label = ttk.Label(self._colored_frame)
-		slider_row(self._colored_frame, 0, self.sat_label, "Saturation min: 35", 0.0, 120.0, self._sat_thresh)
-		self.val_label = ttk.Label(self._colored_frame)
-		slider_row(self._colored_frame, 1, self.val_label, "Dark value max: 80", 0.0, 160.0, self._val_dark)
-		self.clahe_label = ttk.Label(self._colored_frame)
-		slider_row(self._colored_frame, 2, self.clahe_label, "CLAHE clip: 2.00", 1.0, 4.0, self._clahe_clip)
-		self.block_label = ttk.Label(self._colored_frame)
-		slider_row(self._colored_frame, 3, self.block_label, "Adaptive block: 35", 11, 71, self._adaptive_block)
-		self.bias_label = ttk.Label(self._colored_frame)
-		slider_row(self._colored_frame, 4, self.bias_label, "Adaptive C: 15.0", -10.0, 15.0, self._adaptive_c)
-		self.separation_label = ttk.Label(self._colored_frame)
-		slider_row(self._colored_frame, 5, self.separation_label, "Separation: 0.45", 0.25, 0.65, self._separation)
-		self.area_label = ttk.Label(self._colored_frame)
-		slider_row(self._colored_frame, 6, self.area_label, "Min area %: 0.20", 0.05, 1.00, self._min_area)
-		self.circ_label = ttk.Label(self._colored_frame)
-		slider_row(self._colored_frame, 7, self.circ_label, "Min circularity: 0.15", 0.0, 0.9, self._min_circularity)
-		self.stddev_label = ttk.Label(self._colored_frame)
-		slider_row(self._colored_frame, 8, self.stddev_label, "Max V stddev (0=off): 0", 0.0, 60.0, self._stddev_max)
-
-		ttk.Separator(controls, orient="horizontal").grid(
-			row=2, column=0, columnspan=2, sticky="ew", pady=6
-		)
-
-		white_header = ttk.Frame(controls)
-		white_header.grid(row=3, column=0, columnspan=2, sticky="ew")
-		ttk.Label(white_header, text="White pill settings", font=("Segoe UI", 9, "bold")).pack(
-			side="left"
-		)
-		self._white_toggle = ttk.Button(white_header, text="Show", command=self._toggle_white)
-		self._white_toggle.pack(side="right")
-
-		self._white_frame = ttk.Frame(controls)
-		self._white_frame.grid(row=4, column=0, columnspan=2, sticky="ew")
-		self._white_frame.grid_remove()
-
-		self.wp_bright_floor_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 0, self.wp_bright_floor_label, "Brightness floor: 205", 140.0, 240.0, self._wp_brightness_floor)
-		self.morph_open_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 1, self.morph_open_label, "Morph open iter: 1", 1, 6, self._morph_open)
-		self.morph_close_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 2, self.morph_close_label, "Morph close iter: 3", 1, 8, self._morph_close)
-		self.wp_sep_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 3, self.wp_sep_label, "WP separation: 0.40", 0.25, 0.70, self._wp_separation)
-		self.wp_area_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 4, self.wp_area_label, "WP min area %: 0.30", 0.05, 2.0, self._wp_min_area)
-		self.wp_solid_label = ttk.Label(self._white_frame)
-		slider_row(self._white_frame, 5, self.wp_solid_label, "WP solidity: 0.50", 0.10, 1.0, self._wp_solidity)
-
-		controls.columnconfigure(1, weight=1)
 
 		# Scrollable image canvas
 		self.canvas = tk.Canvas(self, highlightthickness=0)
@@ -1156,46 +1077,6 @@ class ImagePipelineUI(tk.Tk):
 
 	# ── Pipeline update ───────────────────────────────────────────────────────
 
-	def _schedule_update(self, _value: str = "") -> None:
-		# Refresh all slider labels immediately for snappy UI feedback
-		self.sat_label.configure(text=f"Saturation min: {self._sat_thresh.get():.0f}")
-		self.val_label.configure(text=f"Dark value max: {self._val_dark.get():.0f}")
-		self.clahe_label.configure(text=f"CLAHE clip: {self._clahe_clip.get():.2f}")
-		self.block_label.configure(text=f"Adaptive block: {int(self._adaptive_block.get())}")
-		self.bias_label.configure(text=f"Adaptive C: {self._adaptive_c.get():.1f}")
-		self.separation_label.configure(text=f"Separation: {self._separation.get():.2f}")
-		self.area_label.configure(text=f"Min area %: {self._min_area.get():.2f}")
-		self.circ_label.configure(text=f"Min circularity: {self._min_circularity.get():.2f}")
-		self.stddev_label.configure(text=f"Max V stddev (0=off): {self._stddev_max.get():.1f}")
-		self.wp_bright_floor_label.configure(text=f"Brightness floor: {self._wp_brightness_floor.get():.0f}")
-		self.morph_open_label.configure(text=f"Morph open iter: {int(self._morph_open.get())}")
-		self.morph_close_label.configure(text=f"Morph close iter: {int(self._morph_close.get())}")
-		self.wp_sep_label.configure(text=f"WP separation: {self._wp_separation.get():.2f}")
-		self.wp_area_label.configure(text=f"WP min area %: {self._wp_min_area.get():.2f}")
-		self.wp_solid_label.configure(text=f"WP solidity: {self._wp_solidity.get():.2f}")
-		# Debounce: wait 120 ms after the last slider move before re-running
-		if self._update_job is not None:
-			self.after_cancel(self._update_job)
-		self._update_job = self.after(120, self._run_pipeline)
-
-	def _toggle_colored(self) -> None:
-		self._colored_visible = not self._colored_visible
-		if self._colored_visible:
-			self._colored_frame.grid()
-			self._colored_toggle.configure(text="Hide")
-		else:
-			self._colored_frame.grid_remove()
-			self._colored_toggle.configure(text="Show")
-
-	def _toggle_white(self) -> None:
-		self._white_visible = not self._white_visible
-		if self._white_visible:
-			self._white_frame.grid()
-			self._white_toggle.configure(text="Hide")
-		else:
-			self._white_frame.grid_remove()
-			self._white_toggle.configure(text="Show")
-
 	def _run_pipeline(self) -> None:
 		for widget in self.content.winfo_children():
 			widget.destroy()
@@ -1204,22 +1085,22 @@ class ImagePipelineUI(tk.Tk):
 
 		processed = process_image(
 			self._image_path,
-			clahe_clip       = float(self._clahe_clip.get()),
+			clahe_clip       = float(self._clahe_clip),
 			clahe_tile       = 8,
-			sat_thresh       = float(self._sat_thresh.get()),
-			val_dark_thresh  = float(self._val_dark.get()),
-			adaptive_block   = int(self._adaptive_block.get()),
-			threshold_bias   = float(self._adaptive_c.get()),
-			separation       = float(self._separation.get()),
-			min_area_ratio   = float(self._min_area.get()) / 100.0,
-			min_circularity  = float(self._min_circularity.get()),
-			stddev_max       = float(self._stddev_max.get()),
-			morph_open           = int(self._morph_open.get()),
-			morph_close          = int(self._morph_close.get()),
-			wp_separation        = float(self._wp_separation.get()),
-			wp_min_area          = float(self._wp_min_area.get()),
-			wp_solidity          = float(self._wp_solidity.get()),
-			wp_brightness_floor  = int(self._wp_brightness_floor.get()),
+			sat_thresh       = float(self._sat_thresh),
+			val_dark_thresh  = float(self._val_dark),
+			adaptive_block   = int(self._adaptive_block),
+			threshold_bias   = float(self._adaptive_c),
+			separation       = float(self._separation),
+			min_area_ratio   = float(self._min_area) / 100.0,
+			min_circularity  = float(self._min_circularity),
+			stddev_max       = float(self._stddev_max),
+			morph_open           = int(self._morph_open),
+			morph_close          = int(self._morph_close),
+			wp_separation        = float(self._wp_separation),
+			wp_min_area          = float(self._wp_min_area),
+			wp_solidity          = float(self._wp_solidity),
+			wp_brightness_floor  = int(self._wp_brightness_floor),
 		)
 
 		self.count_label.configure(text=f"Pills: {processed.pill_count}")
