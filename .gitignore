@@ -2,3 +2,4 @@ backup/
 venv/
 .claude/
 __pycache__/
+DEMO_GUIDE.md
